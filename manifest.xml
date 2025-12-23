@@ -1,0 +1,17 @@
+<Driver type="c4z" name="HA.Light" squishLua="false">
+  <Items>
+    <!-- Core Files -->
+    <Item type="file" name="driver.xml" />
+    <Item type="file" name="commands.lua" />
+    
+    <!-- Documentation -->
+
+    <!-- Icons / Images -->
+
+    <!-- Files to place in subdirectories inside the c4z -->
+    <Item type="file" name="Control4-HA-Base/driver.lua" c4zDir="Control4-HA-Base" />
+    <Item type="file" name="Control4-HA-Base/helpers.lua" c4zDir="Control4-HA-Base" />
+    <Item type="file" name="Control4-HA-Base/module/json.lua" c4zDir="Control4-HA-Base/module" />
+    <Item type="file" name="module/json.lua" c4zDir="module" />
+  </Items>
+</Driver>

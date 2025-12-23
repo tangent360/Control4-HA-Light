@@ -6,7 +6,7 @@
 	<model>HA Light</model>
 	<created>09/10/2023 12:00</created>
 	<modified>03/04/2024 12:00</modified>
-	<version>106</version>
+	<version>107</version>
 	<control>lua_gen</control>
 	<controlmethod>IP</controlmethod>
 	<driver>DriverWorks</driver>
@@ -35,6 +35,14 @@
 				<default>Off</default>
 				<readonly>false</readonly>
 			</property>
+			<property>
+				<name>Color Trace Tolerance</name>
+				<type>RANGED_FLOAT</type>
+				<minimum>0.1</minimum>
+				<maximum>3</maximum>
+				<default>1.5</default>
+				<readonly>false</readonly>
+			</property>
 		</properties>
 		<actions>
 		</actions>
@@ -53,6 +61,9 @@
 		<brightness_rate_min>0</brightness_rate_min>
 		<brightness_rate_max>100000</brightness_rate_max>
 		<advanced_scene_support>True</advanced_scene_support>
+		<color_on_mode_previous>True</color_on_mode_previous>
+		<color_on_mode_fade>True</color_on_mode_fade>
+		<color_trace_tolerance>0.01</color_trace_tolerance>
 	</capabilities>
 	<events/>
 	<connections>

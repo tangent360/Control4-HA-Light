@@ -3,6 +3,7 @@
     <!-- Core Files -->
     <Item type="file" name="driver.xml" />
     <Item type="file" name="commands.lua" />
+    <Item type="file" name="helpers.lua" />
     
     <!-- Documentation -->
 

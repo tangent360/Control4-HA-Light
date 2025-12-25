@@ -12,7 +12,9 @@
 ===============================================================================]]
 
 
-require('Control4-HA-Base.helpers')
+Helpers = require('helpers')
+
+PROXY_DEVICE_STATE = nil
 
 -- Light capabilities (populated from HA state)
 SUPPORTED_ATTRIBUTES = {}
@@ -51,12 +53,20 @@ COLOR_FADE_X = nil
 COLOR_FADE_Y = nil
 COLOR_FADE_MODE = nil
 
+-- Defaults for correct switch on behavior
+DEFAULT_BRIGHTNESS_RATE = 0
+DEFAULT_COLOR_RATE = 0
+COLOR_PRESET_ORIGIN = 0  -- 1 = Previous, 2 = Preset
+PREVIOUS_ON_COLOR_X = nil
+PREVIOUS_ON_COLOR_Y = nil
+PREVIOUS_ON_COLOR_MODE = nil
+
 --[[===========================================================================
     Driver Load Functions
     Scene color matching tolerance (Delta E in CIE L*a*b* space)
 ===========================================================================]]
 
-function OnDriverInit()
+function DRV.OnDriverInit(init)
     -- 1. Read Static Capabilities (Hardware definitions from XML)
     local color_tolerance = C4:GetCapability("color_trace_tolerance")
     if color_tolerance ~= nil then
@@ -75,6 +85,19 @@ function OnDriverInit()
     end
 end
 
+function DRV.OnDriverLateInit(init)
+    local proxyId = C4:GetProxyDevicesById(C4:GetDeviceID())
+    local setupResult = C4:SendUIRequest(proxyId, "GET_SETUP", {})
+    local setupTable = Helpers.xmlToTable(setupResult)
+    setupTable = Helpers.convertTableTypes(setupTable)
+
+    DEFAULT_BRIGHTNESS_RATE = setupTable.light_brightness_rate_default
+
+    if DEBUGPRINT then
+        print("[DEBUG OnDriverLateInit] light_brightness_rate_default set:" .. tostring(DEFAULT_BRIGHTNESS_RATE))
+    end
+end
+
 --[[===========================================================================
     Helper Functions
 ===========================================================================]]
@@ -87,28 +110,188 @@ function BuildBrightnessChangedParams(level)
     return params
 end
 
+function SetLightValue( brightnessTarget, rate)
+    local tParams = {
+        LIGHT_BRIGHTNESS_TARGET = brightnessTarget
+    }
+
+    if rate then
+        tParams.RATE = rate
+    end
+    
+    RFP.SET_BRIGHTNESS_TARGET(nil, nil, tParams)
+end
+
+
 --[[===========================================================================
     Proxy Command Handlers (RFP.*)
 ===========================================================================]]
+
+-- Simple on/off commands (no brightness/color specified)
+function RFP.ON(idBinding, strCommand, tParams)
+    local turnOnServiceCall = {
+        domain = "light",
+        service = "turn_on",
+
+        service_data = {},
+
+        target = {
+            entity_id = EntityID
+        }
+    }
+    tParams = {
+        JSON = JSON:encode(turnOnServiceCall)
+    }
+    C4:SendToProxy(999, "HA_CALL_SERVICE", tParams)
+end
+
+function RFP.OFF(idBinding, strCommand, tParams)
+    local turnOffServiceCall = {
+        domain = "light",
+        service = "turn_off",
+
+        service_data = {},
+
+        target = {
+            entity_id = EntityID
+        }
+    }
+    tParams = {
+        JSON = JSON:encode(turnOffServiceCall)
+    }
+    C4:SendToProxy(999, "HA_CALL_SERVICE", tParams)
+end
+
+-- Button link handlers 
+-- Handle physical button presses (Top=On, Bottom=Off, Toggle)
+--
+-- Bindings:
+--  200=Top
+--  201=Bottom
+--  202=Toggle
+--
+-- From the c4 docs for BUTTON_ACTION():
+--
+--  BUTTON_ID. ID for the button:
+--      0 - Top
+--      1 - Bottom
+--      2 - Toggle
+--  ACTION :
+--      0 - RELEASE (HOLD)
+--      1 - PRESS
+--      2 - RELEASE (CLICK)
+
+function RFP.DO_PUSH(idBinding, strCommand, tParams) 
+    local tParams = { ACTION = "1", BUTTON_ID = "" }
+    if idBinding == 200 then tParams.BUTTON_ID = "0"
+    elseif idBinding == 201 then tParams.BUTTON_ID = "1"
+    elseif idBinding == 202 then tParams.BUTTON_ID = "2" end
+    RFP:BUTTON_ACTION(strCommand, tParams)
+end
+
+function RFP.DO_RELEASE(idBinding, strCommand, tParams) 
+    local tParams = { ACTION = "0", BUTTON_ID = "" }
+    if idBinding == 200 then tParams.BUTTON_ID = "0"
+    elseif idBinding == 201 then tParams.BUTTON_ID = "1"
+    elseif idBinding == 202 then tParams.BUTTON_ID = "2" end
+    RFP:BUTTON_ACTION(strCommand, tParams)
+end
+
+function RFP.DO_CLICK(idBinding, strCommand, tParams)
+    local tParams = { ACTION = "2", BUTTON_ID = "" }
+    if idBinding == 200 then tParams.BUTTON_ID = "0"
+    elseif idBinding == 201 then tParams.BUTTON_ID = "1"
+    elseif idBinding == 202 then tParams.BUTTON_ID = "2" end
+    RFP:BUTTON_ACTION(strCommand, tParams)
+end
+
+function RFP.BUTTON_ACTION(idBinding, strCommand, tParams)
+
+    -- PRESS physical action ... dont know if this will be a 
+    -- CLICK or a HOLD, so start a long ramp immediately in 
+    -- the correct direction ... the CLICK is coming immenently
+    -- and we'll correct, or else it's a HOLD.
+    -- The lack of of a stop command in HA makes this difficult.
+    if tParams.ACTION == "1" then
+        local rate = 5000. -- this is controling the press & hold ramp rate.
+        RAMP_START_TIME_MS = C4:GetTime() -- system time in ms.
+        RAMP_DURATION_MS = rate
+        RAMP_START_LEVEL = LIGHT_LEVEL -- Current level when ramp starts
+
+        if tParams.BUTTON_ID == "0" then 
+            RAMP_TARGET_LEVEL = 100
+            SetLightValue(RAMP_TARGET_LEVEL, rate)
+        elseif tParams.BUTTON_ID == "1" then
+            -- ridiculous situation where a turn_off followed by
+            -- an overriding turn_off at HA results in immediate 
+            -- turn off.  So turn_on to low (1%), then turn_off
+            -- if it turns out to be a click event.
+            RAMP_TARGET_LEVEL = 1
+            SetLightValue(RAMP_TARGET_LEVEL, rate)
+        else
+            if WAS_ON then
+                RAMP_TARGET_LEVEL = 1
+                SetLightValue(RAMP_TARGET_LEVEL, rate)
+            else
+                RAMP_TARGET_LEVEL = 100
+                SetLightValue(RAMP_TARGET_LEVEL, rate)
+            end
+        end
+    end
+
+    -- RELEASE from a HOLD event
+    -- Set the brightness to the current level.
+    if tParams.ACTION == "0" then
+        SetLightValue(Helpers.lerp(RAMP_START_LEVEL, 
+                            RAMP_TARGET_LEVEL, 
+                            C4:GetTime() - RAMP_START_TIME_MS,
+                            RAMP_DURATION_MS), 0)
+    end
+
+    -- Release from a CLICK event
+    if tParams.ACTION == "2" then
+        if tParams.BUTTON_ID == "0" then
+            SetLightValue(100, nil)
+        elseif tParams.BUTTON_ID == "1" then
+            SetLightValue(0, nil)
+        else
+            if WAS_ON then
+                SetLightValue(0, nil)
+            else
+                SetLightValue(100, nil)
+            end
+        end
+    end
+end
 
 -- Called by Director to sync current state
 function RFP.SYNCHRONIZE(idBinding, strCommand, tParams)
     C4:SendToProxy(5001, 'LIGHT_BRIGHTNESS_CHANGED', BuildBrightnessChangedParams(LIGHT_LEVEL))
 end
 
--- Handle physical button presses (Top=On, Bottom=Off, Toggle)
-function RFP.BUTTON_ACTION(idBinding, strCommand, tParams)
-    if tParams.ACTION == "2" then
-        if tParams.BUTTON_ID == "0" then
-            SetLightValue(100)
-        elseif tParams.BUTTON_ID == "1" then
-            SetLightValue(0)
-        else
-            if WAS_ON then
-                SetLightValue(0)
-            else
-                SetLightValue(100)
-            end
+function RFP.UPDATE_BRIGHTNESS_RATE_DEFAULT(idBinding, strCommand, tParams)
+    DEFAULT_BRIGHTNESS_RATE = tonumber(tParams.RATE) or 0
+    if DEBUGPRINT then
+        print("[DEBUG] Default brightness rate set to: " .. tostring(DEFAULT_BRIGHTNESS_RATE) .. "ms")
+    end
+end
+
+function RFP.UPDATE_COLOR_RATE_DEFAULT(idBinding, strCommand, tParams)
+    DEFAULT_COLOR_RATE = tonumber(tParams.RATE) or 0
+    if DEBUGPRINT then
+        print("[DEBUG] Default color rate set to: " .. tostring(DEFAULT_COLOR_RATE) .. "ms")
+    end
+end
+
+function RFP.UPDATE_COLOR_PRESET(idBinding, strCommand, tParams)
+    -- Track "Previous On" color when light turns off
+    if tParams.NAME == "Previous On" then
+        PREVIOUS_ON_COLOR_X = tonumber(tParams.COLOR_X)
+        PREVIOUS_ON_COLOR_Y = tonumber(tParams.COLOR_Y)
+        PREVIOUS_ON_COLOR_MODE = tonumber(tParams.COLOR_MODE)
+        if DEBUGPRINT then
+            print("[DEBUG COLOR] Previous On color updated: XY(" .. 
+                  tostring(PREVIOUS_ON_COLOR_X) .. "," .. tostring(PREVIOUS_ON_COLOR_Y) .. ")")
         end
     end
 end
@@ -289,7 +472,7 @@ function RFP.ACTIVATE_SCENE(idBinding, strCommand, tParams)
         return
     end
 
-    -- Execute brightness only (no color in scene)
+    -- Execute brightness
     if levelEnabled or (el.level ~= nil or el.brightness ~= nil) then
         RFP.SET_BRIGHTNESS_TARGET(nil, nil, {
             LIGHT_BRIGHTNESS_TARGET = el.level or el.brightness or 0,
@@ -297,7 +480,7 @@ function RFP.ACTIVATE_SCENE(idBinding, strCommand, tParams)
         })
     end
 
-    -- Execute color only (no brightness in scene)
+    -- Execute color
     if colorEnabled then
         RFP.SET_COLOR_TARGET(nil, nil, {
             LIGHT_COLOR_TARGET_X = el.colorX,
@@ -325,18 +508,18 @@ function RFP.RAMP_SCENE_UP(idBinding, strCommand, tParams)
     end
 
     local target = el.level or el.brightness or 100
-    SCENE_RAMP_START_TIME_MS = C4:GetTime() -- system time in ms.
-    SCENE_RAMP_DURATION_MS = rate
-    SCENE_RAMP_START_LEVEL = LIGHT_LEVEL -- Current level when ramp starts
-    SCENE_RAMP_TARGET_LEVEL = target
+    RAMP_START_TIME_MS = C4:GetTime() -- system time in ms.
+    RAMP_DURATION_MS = rate
+    RAMP_START_LEVEL = LIGHT_LEVEL -- Current level when ramp starts
+    RAMP_TARGET_LEVEL = target
 
     if DEBUGPRINT then
         print("rate = " .. tostring(rate))
         print("target = " .. tostring(target))
-        print("SCENE_RAMP_START_TIME_MS = " .. tostring(SCENE_RAMP_START_TIME_MS))
-        print("SCENE_RAMP_DURATION_MS = " .. tostring(SCENE_RAMP_DURATION_MS))
-        print("SCENE_RAMP_START_LEVEL = " .. tostring(SCENE_RAMP_START_LEVEL))
-        print("SCENE_RAMP_TARGET_LEVEL = " .. tostring(SCENE_RAMP_TARGET_LEVEL))
+        print("RAMP_START_TIME_MS = " .. tostring(RAMP_START_TIME_MS))
+        print("RAMP_DURATION_MS = " .. tostring(RAMP_DURATION_MS))
+        print("RAMP_START_LEVEL = " .. tostring(RAMP_START_LEVEL))
+        print("RAMP_TARGET_LEVEL = " .. tostring(RAMP_TARGET_LEVEL))
     end
 
     -- Ramp to scene's target brightness
@@ -358,11 +541,19 @@ function RFP.RAMP_SCENE_DOWN(idBinding, strCommand, tParams)
 
     local el = C4:PersistGetValue("ALS:" .. sceneId, false)
     local target = el.level or el.brightness or 100
-    print("[DEBUG ALS] RAMP_SCENE_DOWN: scene=" .. tostring(sceneId) .. ", target=" .. tostring(target))
-    SCENE_RAMP_START_TIME_MS = C4:GetTime() -- system time in ms.
-    SCENE_RAMP_DURATION_MS = rate
-    SCENE_RAMP_START_LEVEL = LIGHT_LEVEL -- Current level when ramp starts
-    SCENE_RAMP_TARGET_LEVEL = 0
+    RAMP_START_TIME_MS = C4:GetTime() -- system time in ms.
+    RAMP_DURATION_MS = rate
+    RAMP_START_LEVEL = LIGHT_LEVEL -- Current level when ramp starts
+    RAMP_TARGET_LEVEL = 0
+
+    if DEBUGPRINT then
+        print("rate = " .. tostring(rate))
+        print("target = " .. tostring(target))
+        print("RAMP_START_TIME_MS = " .. tostring(RAMP_START_TIME_MS))
+        print("RAMP_DURATION_MS = " .. tostring(RAMP_DURATION_MS))
+        print("RAMP_START_LEVEL = " .. tostring(RAMP_START_LEVEL))
+        print("RAMP_TARGET_LEVEL = " .. tostring(RAMP_TARGET_LEVEL))
+    end
 
     -- Ramp to 0
     RFP.SET_BRIGHTNESS_TARGET(nil, nil, {
@@ -374,13 +565,12 @@ end
 -- Stop an in-progress scene ramp (user released button).
 -- Sends current level to HA to freeze at current position.
 function RFP.STOP_SCENE_RAMP(idBinding, strCommand, tParams)
-    local elapsedTimeMs = C4:GetTime() - SCENE_RAMP_START_TIME_MS
+    local elapsedTimeMs = C4:GetTime() - RAMP_START_TIME_MS
     local sceneId = tParams.SCENE_ID
 
     if DEBUGPRINT then
         print("[DEBUG ALS] STOP_SCENE_RAMP: scene=" .. tostring(sceneId) .. ", freezing at level=" .. tostring(LIGHT_LEVEL))
-        print("[DEBUG ALS] STOP_SCENE_RAMP: tParams:")
-        DumpTable(tParams)
+        Helpers.dumpTable(tParams, "RFP.STOP_SCENE_RAMP tParams")
     end
 
     -- Cancel any pending ramp timer
@@ -389,10 +579,10 @@ function RFP.STOP_SCENE_RAMP(idBinding, strCommand, tParams)
         BRIGHTNESS_RAMP_TIMER = nil
     end
 
-    newTargetLevel = Lerp(SCENE_RAMP_START_LEVEL, 
-                        SCENE_RAMP_TARGET_LEVEL, 
+    newTargetLevel = Helpers.lerp(RAMP_START_LEVEL, 
+                        RAMP_TARGET_LEVEL, 
                         elapsedTimeMs,
-                        SCENE_RAMP_DURATION_MS)
+                        RAMP_DURATION_MS)
 
     if DEBUGPRINT then
         print("[DEBUG ALS] STOP_SCENE_RAMP: elapsedTimeMs=" .. tostring(elapsedTimeMs) .. ", newTargetLevel=" .. tostring(newTargetLevel))
@@ -421,11 +611,11 @@ end
 -- In "Fade" mode, stores On/Dim colors for dim-to-warm interpolation.
 function RFP.UPDATE_COLOR_ON_MODE(idBinding, strCommand, tParams)
     if DEBUGPRINT then
-        print("[DEBUG COLOR] UPDATE_COLOR_ON_MODE received:")
-        for k, v in pairs(tParams) do
-            print("[DEBUG COLOR]   " .. tostring(k) .. " = " .. tostring(v))
-        end
+        Helpers.dumpTable(tParams, "RFP.UPDATE_COLOR_ON_MODE tParams")
     end
+
+    -- Track origin: 1 = Previous, 2 = Preset
+    COLOR_PRESET_ORIGIN = tonumber(tParams.COLOR_PRESET_ORIGIN) or 0
 
     -- Store the "On" color (at 100% brightness)
     COLOR_ON_X = tonumber(tParams.COLOR_PRESET_COLOR_X)
@@ -437,72 +627,21 @@ function RFP.UPDATE_COLOR_ON_MODE(idBinding, strCommand, tParams)
     COLOR_FADE_Y = tonumber(tParams.COLOR_FADE_PRESET_COLOR_Y)
     COLOR_FADE_MODE = tonumber(tParams.COLOR_FADE_PRESET_COLOR_MODE)
 
-    -- Fade mode is enabled if we have both On and Dim colors defined
-    COLOR_ON_MODE_FADE_ENABLED = (COLOR_FADE_X ~= nil) and (COLOR_ON_X ~= nil)
+    -- Fade mode is enabled if fade preset ID is non-zero and we have both colors
+    local fadePresetId = tonumber(tParams.COLOR_FADE_PRESET_ID) or 0
+    COLOR_ON_MODE_FADE_ENABLED = (fadePresetId ~= 0) and (COLOR_FADE_X ~= nil) and (COLOR_ON_X ~= nil)
 
     if DEBUGPRINT then
-        print("[DEBUG COLOR] UPDATE_COLOR_ON_MODE: fade_enabled=" .. tostring(COLOR_ON_MODE_FADE_ENABLED))
+        print("[DEBUG COLOR] UPDATE_COLOR_ON_MODE: origin=" .. tostring(COLOR_PRESET_ORIGIN) ..
+              ", fade_enabled=" .. tostring(COLOR_ON_MODE_FADE_ENABLED))
         print("[DEBUG COLOR]   On color: X=" .. tostring(COLOR_ON_X) .. ", Y=" .. tostring(COLOR_ON_Y))
         print("[DEBUG COLOR]   Dim color: X=" .. tostring(COLOR_FADE_X) .. ", Y=" .. tostring(COLOR_FADE_Y))
     end
 end
 
--- Simple on/off commands (no brightness/color specified)
-function RFP.ON(idBinding, strCommand, tParams)
-    local turnOnServiceCall = {
-        domain = "light",
-        service = "turn_on",
 
-        service_data = {},
-
-        target = {
-            entity_id = EntityID
-        }
-    }
-    tParams = {
-        JSON = JSON:encode(turnOnServiceCall)
-    }
-    C4:SendToProxy(999, "HA_CALL_SERVICE", tParams)
-end
-
-function RFP.OFF(idBinding, strCommand, tParams)
-    local turnOffServiceCall = {
-        domain = "light",
-        service = "turn_off",
-
-        service_data = {},
-
-        target = {
-            entity_id = EntityID
-        }
-    }
-    tParams = {
-        JSON = JSON:encode(turnOffServiceCall)
-    }
-    C4:SendToProxy(999, "HA_CALL_SERVICE", tParams)
-end
-
--- Button link handlers (bindings 200=Top, 201=Bottom, 202=Toggle)
-function RFP.DO_PUSH(idBinding, strCommand, tParams) end
-function RFP.DO_RELEASE(idBinding, strCommand, tParams) end
-
-function RFP.DO_CLICK(idBinding, strCommand, tParams)
-    local tParams = { ACTION = "2", BUTTON_ID = "" }
-    if idBinding == 200 then tParams.BUTTON_ID = "0"
-    elseif idBinding == 201 then tParams.BUTTON_ID = "1"
-    elseif idBinding == 202 then tParams.BUTTON_ID = "2" end
-    RFP:BUTTON_ACTION(strCommand, tParams)
-end
-
-function SetLightValue(value)
-    local tParams = {
-        LIGHT_BRIGHTNESS_TARGET = value
-    }
-
-    RFP.SET_BRIGHTNESS_TARGET(nil, nil, tParams)
-end
-
--- Set light color. Converts C4 XY coordinates to HA format (CCT or xy_color).
+-- Set light color. 
+-- Converts C4 XY coordinates to CCT if light only supports CCT.
 -- In fade mode, ignores commands matching On/Dim presets to prevent override.
 function RFP.SET_COLOR_TARGET(idBinding, strCommand, tParams)
     local targetX = tonumber(tParams.LIGHT_COLOR_TARGET_X)
@@ -665,22 +804,30 @@ end
 -- Set light brightness with optional transition rate.
 -- In fade mode, also calculates and applies interpolated color.
 function RFP.SET_BRIGHTNESS_TARGET(idBinding, strCommand, tParams)
+
+    if DEBUGPRINT then
+        Helpers.dumpTable(tParams, "RFP.SET_BRIGHTNESS_TARGET tParams")
+    end
+
     local target = tonumber(tParams.LIGHT_BRIGHTNESS_TARGET)
-    local rate = tonumber(tParams.RATE) or 0  -- Rate in milliseconds from C4
-    local presetId = tParams.LIGHT_BRIGHTNESS_TARGET_PRESET_ID  -- Optional preset ID for Daylight Agent
+    local rate = tonumber(tParams.RATE)
+    local presetId = tParams.LIGHT_BRIGHTNESS_TARGET_PRESET_ID
+
+    -- Apply default rate if not specified
+    if rate == nil then
+        rate = DEFAULT_BRIGHTNESS_RATE
+    end
+
+    -- Detect off→on transition
+    local turningOn = (LIGHT_LEVEL == 0 or not WAS_ON) and target > 0
 
     -- Track preset ID and target level for reporting in LIGHT_BRIGHTNESS_CHANGED
     if presetId ~= nil then
         LIGHT_BRIGHTNESS_PRESET_ID = tonumber(presetId)
-        LIGHT_BRIGHTNESS_PRESET_LEVEL = target  -- Track target level for this preset
+        LIGHT_BRIGHTNESS_PRESET_LEVEL = target
     else
         LIGHT_BRIGHTNESS_PRESET_ID = nil
         LIGHT_BRIGHTNESS_PRESET_LEVEL = nil
-    end
-
-    -- DEBUG: Log incoming parameters
-    if DEBUGPRINT then
-        print("[DEBUG RAMP] SET_BRIGHTNESS_TARGET: target=" .. tostring(target) .. ", rate=" .. tostring(rate) .. "ms, presetId=" .. tostring(presetId))
     end
 
     -- Cancel any existing ramp timer
@@ -690,26 +837,22 @@ function RFP.SET_BRIGHTNESS_TARGET(idBinding, strCommand, tParams)
     end
 
     -- Set up ramp timer to send CHANGED after ramp completes
-    -- HA reports target state immediately, so we suppress CHANGED during ramp
     if rate > 0 then
         BRIGHTNESS_RAMP_PENDING = false
         BRIGHTNESS_RAMP_TIMER = C4:SetTimer(rate, function(timer)
             BRIGHTNESS_RAMP_TIMER = nil
             if DEBUGPRINT then
-                print("[DEBUG RAMP] Ramp timer complete, LIGHT_LEVEL=" .. tostring(LIGHT_LEVEL) .. ", pending=" .. tostring(BRIGHTNESS_RAMP_PENDING))
+                print("[DEBUG RAMP] Ramp timer complete, LIGHT_LEVEL=" .. tostring(LIGHT_LEVEL) .. 
+                      ", pending=" .. tostring(BRIGHTNESS_RAMP_PENDING))
             end
-            -- If we received a state update during ramp, now send CHANGED
             if BRIGHTNESS_RAMP_PENDING then
                 BRIGHTNESS_RAMP_PENDING = false
-                if DEBUGPRINT then
-                    print("[DEBUG RAMP] Forwarding LIGHT_BRIGHTNESS_CHANGED to director, level=" .. tostring(LIGHT_LEVEL) .. ", presetId=" .. tostring(LIGHT_BRIGHTNESS_PRESET_ID))
-                end
                 C4:SendToProxy(5001, 'LIGHT_BRIGHTNESS_CHANGED', BuildBrightnessChangedParams(LIGHT_LEVEL))
             end
         end)
     end
 
-    -- Notify proxy that brightness is changing (Brightness Target API)
+    -- Notify proxy that brightness is changing
     C4:SendToProxy(5001, 'LIGHT_BRIGHTNESS_CHANGING', {
         LIGHT_BRIGHTNESS_CURRENT = LIGHT_LEVEL,
         LIGHT_BRIGHTNESS_TARGET = target,
@@ -720,61 +863,100 @@ function RFP.SET_BRIGHTNESS_TARGET(idBinding, strCommand, tParams)
     local brightnessServiceCall = {
         domain = "light",
         service = "turn_on",
-
         service_data = {
             brightness = targetMappedValue
         },
-
         target = {
             entity_id = EntityID
         }
     }
 
-    -- Add transition time for dimmable lights (convert ms to seconds)
-    -- Always set transition to override HA's default (even when 0 for instant)
+    -- Add transition time for dimmable lights
     if HAS_BRIGHTNESS then
+        print("[DEBUG RAMP] SET_BRIGHTNESS_TARGET: Adding transition time of " .. tostring(rate) .. "ms")
         brightnessServiceCall.service_data.transition = rate / 1000
     end
 
-    -- Dim-to-warm: Calculate and apply interpolated color based on brightness
-    if COLOR_ON_MODE_FADE_ENABLED and target > 0 and COLOR_ON_X and COLOR_FADE_X then
-        -- Formula: colorFinal = colorDim + (colorOn - colorDim) * brightness * 0.01
-        local fadeX = COLOR_FADE_X + (COLOR_ON_X - COLOR_FADE_X) * target * 0.01
-        local fadeY = COLOR_FADE_Y + (COLOR_ON_Y - COLOR_FADE_Y) * target * 0.01
+    -- Determine color to apply
+    local colorX, colorY, colorMode = nil, nil, nil
 
-        if DEBUGPRINT then
-            print("[DEBUG COLOR] Dim-to-warm: brightness=" .. tostring(target) .. "% -> XY(" .. tostring(fadeX) .. "," .. tostring(fadeY) .. ")")
+    if target > 0 then
+        if COLOR_ON_MODE_FADE_ENABLED and COLOR_ON_X and COLOR_FADE_X then
+            -- Fade/Dim-to-warm: Always interpolate color based on brightness level
+            colorX = COLOR_FADE_X + (COLOR_ON_X - COLOR_FADE_X) * target * 0.01
+            colorY = COLOR_FADE_Y + (COLOR_ON_Y - COLOR_FADE_Y) * target * 0.01
+            colorMode = COLOR_ON_MODE
+            
+            if DEBUGPRINT then
+                print("[DEBUG COLOR] Dim-to-warm: brightness=" .. tostring(target) .. 
+                      "% -> XY(" .. tostring(colorX) .. "," .. tostring(colorY) .. ")")
+            end
+        elseif turningOn then
+            -- Not fade mode, but turning on - check preset vs previous
+            if COLOR_PRESET_ORIGIN == 1 and PREVIOUS_ON_COLOR_X then
+                -- Previous mode: restore last color
+                colorX = PREVIOUS_ON_COLOR_X
+                colorY = PREVIOUS_ON_COLOR_Y
+                colorMode = PREVIOUS_ON_COLOR_MODE
+                
+                if DEBUGPRINT then
+                    print("[DEBUG COLOR] Applying previous on-color: XY(" .. 
+                          tostring(colorX) .. "," .. tostring(colorY) .. ")")
+                end
+            elseif COLOR_PRESET_ORIGIN == 2 and COLOR_ON_X then
+                -- Preset mode: apply configured preset color
+                colorX = COLOR_ON_X
+                colorY = COLOR_ON_Y
+                colorMode = COLOR_ON_MODE
+                
+                if DEBUGPRINT then
+                    print("[DEBUG COLOR] Applying preset on-color: XY(" .. 
+                          tostring(colorX) .. "," .. tostring(colorY) .. ")")
+                end
+            end
         end
 
-        -- Check if light supports CCT or XY
-        local lightSupportsCCT = HasValue(SUPPORTED_ATTRIBUTES, "color_temp")
-        if lightSupportsCCT then
-            local kelvin = C4:ColorXYtoCCT(fadeX, fadeY)
-            brightnessServiceCall.service_data.color_temp_kelvin = kelvin
-            if DEBUGPRINT then
-                print("[DEBUG COLOR] Dim-to-warm: sending as CCT " .. tostring(kelvin) .. "K")
+        -- Apply color if determined
+        if colorX and colorY then
+            local lightSupportsCCT = HasValue(SUPPORTED_ATTRIBUTES, "color_temp")
+            if lightSupportsCCT and (colorMode == 1 or colorMode == nil) then
+                local kelvin = C4:ColorXYtoCCT(colorX, colorY)
+                brightnessServiceCall.service_data.color_temp_kelvin = kelvin
+                if DEBUGPRINT then
+                    print("[DEBUG COLOR] Sending as CCT " .. tostring(kelvin) .. "K")
+                end
+            else
+                brightnessServiceCall.service_data.xy_color = { colorX, colorY }
+                if DEBUGPRINT then
+                    print("[DEBUG COLOR] Sending as XY")
+                end
             end
-        else
-            brightnessServiceCall.service_data.xy_color = { fadeX, fadeY }
+
+            -- Notify proxy of color change
+            C4:SendToProxy(5001, 'LIGHT_COLOR_CHANGING', {
+                LIGHT_COLOR_TARGET_X = colorX,
+                LIGHT_COLOR_TARGET_Y = colorY,
+                LIGHT_COLOR_TARGET_COLOR_MODE = colorMode or 0,
+                LIGHT_COLOR_TARGET_COLOR_RATE = DEFAULT_COLOR_RATE
+            })
         end
     end
+
 
     if not HAS_BRIGHTNESS then
         brightnessServiceCall.service_data = {}
     end
 
     if target == 0 then
-        -- Preserve transition for turn_off
         local transition = brightnessServiceCall.service_data.transition
         brightnessServiceCall.service_data = { transition = transition }
         brightnessServiceCall["service"] = "turn_off"
     end
 
-    tParams = {
-        JSON = JSON:encode(brightnessServiceCall)
-    }
 
-    C4:SendToProxy(999, "HA_CALL_SERVICE", tParams)
+    Helpers.dumpTable(brightnessServiceCall, "Brightness Service Call to HA")
+
+    C4:SendToProxy(999, "HA_CALL_SERVICE", { JSON = JSON:encode(brightnessServiceCall) })
 end
 
 -- Legacy level commands - redirect to SET_BRIGHTNESS_TARGET
@@ -1062,5 +1244,9 @@ function OPC.Color_Trace_Tolerance(value)
 
     C4:SendToProxy(5001, 'DYNAMIC_CAPABILITIES_CHANGED', {
         color_trace_tolerance = COLOR_TRACE_TOLERANCE
+    }, "NOTIFY")
+
+    C4:SendToProxy(5001, 'DYNAMIC_CAPABILITIES_CHANGED', {
+        color_trace_tolerance = 0.01
     }, "NOTIFY")
 end
